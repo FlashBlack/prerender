@@ -2,19 +2,40 @@ package main
 
 import (
 	"context"
+	"crypto/md5"
 	"fmt"
 	"github.com/chromedp/cdproto/dom"
 	"github.com/chromedp/chromedp"
+	"github.com/go-redis/redis/v7"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"time"
 )
 
 var (
-	taskCtx context.Context
+	taskCtx     context.Context
+	redisClient *RedisClient
 )
 
+type cachePage struct {
+	Url string
+	Content string
+}
+
+func (cache *cachePage) GetRedisKey() string {
+	return fmt.Sprintf("prerender:%x", md5.Sum([]byte(cache.Url)))
+}
+
+func (cache *cachePage) GetTtl() time.Duration {
+	return 1 * time.Minute
+}
+
 func main() {
+	redisClient = NewRedisClient()
+	defer redisClient.Close()
+
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.DisableGPU,
 	)
@@ -47,30 +68,42 @@ func main() {
 }
 
 func ssrHandler(w http.ResponseWriter, r *http.Request) {
-	if len(r.URL.Path) >= 6 && r.URL.Path[:6] == "/sdapi" {
+	requestUrl, _ := url.ParseRequestURI(r.URL.RawQuery)
+	if requestUrl == nil {
 		return
 	}
 
-	var buffer string
-	var url = "https://ab.onliner.by" + r.RequestURI
-
-	tabCtx, tabCancel := chromedp.NewContext(taskCtx)
-	defer tabCancel()
-
-	log.Print("Fetch url " + url)
-
-	if err := chromedp.Run(tabCtx, getHtmlContent(url, &buffer)); err != nil {
-		log.Print(err)
+	cache := &cachePage{
+		Url: requestUrl.String(),
 	}
 
-	_, err := fmt.Fprint(w, buffer)
+	err := redisClient.GetKey(cache.GetRedisKey(), cache)
+	if err == redis.Nil {
+		tabCtx, tabCancel := chromedp.NewContext(taskCtx)
+		defer tabCancel()
+
+		log.Print("Fetch url " + cache.Url)
+
+		if err := chromedp.Run(tabCtx, GetHtmlContent(cache.Url, &cache.Content)); err != nil {
+			log.Print(err)
+		}
+
+		err := redisClient.SetKey(cache.GetRedisKey(), cache, cache.GetTtl())
+		if err != nil {
+			log.Print(err)
+		}
+	} else if err != nil {
+		log.Fatal(err)
+	}
+
+	_, err = fmt.Fprint(w, cache.Content)
 	if err != nil {
 		log.Print(err)
 		w.WriteHeader(http.StatusInternalServerError)
 	}
 }
 
-func getHtmlContent(url string, output *string) chromedp.Tasks {
+func GetHtmlContent(url string, output *string) chromedp.Tasks {
 	return chromedp.Tasks{
 		chromedp.Navigate(url),
 		chromedp.ActionFunc(func(ctx context.Context) error {
